@@ -10,6 +10,8 @@ setup(
     long_description_content_type='text/markdown',
     url='https://github.com/TURROKS/CVE_Prioritizer',
     packages=find_packages(),
+    package_data={'scripts': ['templates/*.html']},
+    include_package_data=True,
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: BSD License',
@@ -22,6 +24,7 @@ setup(
         'setuptools',
         'requests',
         'python-dotenv',
+        'jinja2',
         'termcolor',
         'click'
     ],

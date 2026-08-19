@@ -4,3 +4,4 @@ python-dotenv>=0.19.2
 requests>=2.32.3
 termcolor>=2.2.0
 fade
+jinja2>=3.0.0

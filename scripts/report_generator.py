@@ -5,8 +5,8 @@ import os
 
 
 def generate_report(data, output_path="report.html", format="html"):
-    # Set the path to the templates folder
-    template_dir = Path(__file__).resolve().parent.parent / "docs" / "templates"
+    # Set the path to the templates folder (shipped inside the scripts package)
+    template_dir = Path(__file__).resolve().parent / "templates"
     env = Environment(loader=FileSystemLoader(str(template_dir)))
 
     # Load the dashboard-style template
