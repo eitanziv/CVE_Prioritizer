@@ -29,31 +29,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CISA KEV catalog, downloaded at most once per run and shared by every worker thread
-_kev_catalog = None
-_kev_catalog_lock = threading.Lock()
+# FIRST.org returns at most 100 rows per response, and 100 comma-separated IDs keeps the
+# query around 1.4 KB - well under the roughly 2 KB point past which the API stops
+# returning rows and answers "status": "OK" with "total": 0 instead of erroring.
+EPSS_BATCH_SIZE = 100
+
+# Populated by epss_batch_prefetch before any worker thread starts, read-only thereafter
+_epss_cache = {}
 
 
-def _get_kev_catalog():
+def epss_batch_prefetch(cve_ids):
     """
-    Return CISA's KEV catalog as a {cveID: entry} mapping, fetching it at most once per run.
+    Fetch EPSS scores for a whole run up front, in batches, and cache them for epss_check.
 
-    Callers previously downloaded the multi-MB feed once per KEV-listed CVE. The double-checked
-    lock keeps the concurrent workers from all starting that download at the same time; a failed
-    fetch is deliberately not cached, so the exception reaches the caller's existing handler
-    exactly as it did before and the next CVE retries.
+    FIRST.org accepts a comma-separated ?cve= list, so a scan that would otherwise issue one
+    request per CVE is served by ceil(N/100) instead. Anything that fails, or that EPSS does
+    not know about, is simply left out of the cache: epss_check then falls back to its own
+    per-CVE request and the run behaves exactly as it did before.
     """
-    global _kev_catalog
+    ids = sorted({str(cve).upper().strip() for cve in cve_ids if cve})
 
-    if _kev_catalog is None:
-        with _kev_catalog_lock:
-            if _kev_catalog is None:
-                kev_data = requests.get(CISA_KEV_URL)
-                kev_data.raise_for_status()
-                _kev_catalog = {entry.get('cveID'): entry
-                                for entry in kev_data.json().get('vulnerabilities', [])}
+    for start in range(0, len(ids), EPSS_BATCH_SIZE):
+        batch = ids[start:start + EPSS_BATCH_SIZE]
+        try:
+            epss_response = requests.get(EPSS_URL, params={"cve": ",".join(batch)})
+            epss_response.raise_for_status()
 
-    return _kev_catalog
+            for entry in epss_response.json().get("data", []):
+                cve = entry.get("cve")
+                if cve:
+                    # The API returns these as strings; worker compares them against floats
+                    _epss_cache[cve.upper().strip()] = {"epss": float(entry.get("epss")),
+                                                        "percentile": float(entry.get("percentile"))}
+        except (requests.exceptions.RequestException, ValueError, TypeError) as batch_err:
+            logger.warning(f"EPSS batch lookup failed, falling back to per-CVE requests: {batch_err}")
 
 
 # Collect EPSS Scores
@@ -61,6 +70,10 @@ def epss_check(cve_id):
     """
     Function collects EPSS from FIRST.org
     """
+    cached = _epss_cache.get(str(cve_id).upper().strip())
+    if cached:
+        return cached
+
     try:
         epss_url = EPSS_URL + f"?cve={cve_id}"
         epss_response = requests.get(epss_url)
