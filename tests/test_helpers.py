@@ -1,14 +1,17 @@
 import io
-from threading import Semaphore
+from threading import Semaphore, Thread
 
 import pytest
 
 from scripts import helpers
+from scripts.constants import CISA_KEV_URL
 from scripts.helpers import (
     is_valid_cve,
+    nist_check,
     parse_cpe,
     parse_report,
     truncate_string,
+    vulncheck_check,
     worker,
 )
 
@@ -215,3 +218,123 @@ def test_worker_writes_csv_row(monkeypatch):
     assert row[1] == "Priority 1"
     assert row[2] == "0.9"
     assert row[3] == "0.97"
+
+
+# ---------------------------------------------------------------------------
+# CISA KEV catalog cache
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+_KEV_PAYLOAD = {
+    "vulnerabilities": [
+        {"cveID": "CVE-2021-44228", "knownRansomwareCampaignUse": "Known"},
+    ]
+}
+
+_NVD_KEV_PAYLOAD = {
+    "totalResults": 1,
+    "vulnerabilities": [
+        {
+            "cve": {
+                "cisaExploitAdd": "2021-12-10",
+                "configurations": [
+                    {"nodes": [{"cpeMatch": [{"criteria": "cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*"}]}]}
+                ],
+                "metrics": {
+                    "cvssMetricV31": [
+                        {
+                            "cvssData": {
+                                "baseScore": 10.0,
+                                "baseSeverity": "CRITICAL",
+                                "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+    ],
+}
+
+_VULNCHECK_PAYLOAD = {
+    "_meta": {"total_documents": 1},
+    "data": [
+        {
+            "id": "CVE-2020-29127",
+            "cisaExploitAdd": None,
+            "configurations": [
+                {"nodes": [{"cpeMatch": [{"criteria": "cpe:2.3:a:vendor:product:1.0:*:*:*:*:*:*:*"}]}]}
+            ],
+            "metrics": {
+                "cvssMetricV31": [
+                    {
+                        "cvssData": {
+                            "baseScore": 7.5,
+                            "baseSeverity": "HIGH",
+                            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+                        }
+                    }
+                ]
+            },
+        }
+    ],
+}
+
+
+def _stub_requests_get(monkeypatch, source_payload, kev_hits=None):
+    """Route requests.get to the CISA KEV feed or the CVE source by URL."""
+    def fake_get(url, **kwargs):
+        if url == CISA_KEV_URL:
+            if kev_hits is not None:
+                kev_hits.append(url)
+            return _FakeResponse(_KEV_PAYLOAD)
+        return _FakeResponse(source_payload)
+
+    monkeypatch.setattr(helpers.requests, "get", fake_get)
+
+
+def test_nist_check_kev_cve_reads_ransomware_flag_from_catalog(monkeypatch):
+    # nist_check reaches the catalog only for KEV-listed CVEs; a missing
+    # _get_kev_catalog raises NameError here and the CVE silently vanishes.
+    _stub_requests_get(monkeypatch, _NVD_KEV_PAYLOAD)
+
+    result = nist_check("CVE-2021-44228", None, 3)
+
+    assert result.get("cisa_kev") == "2021-12-10"
+    assert result.get("ransomware") == "KNOWN"
+    assert result.get("cvss_baseScore") == 10.0
+
+
+def test_vulncheck_check_reaches_catalog_for_every_cve(monkeypatch):
+    # The NVD++ path calls the catalog before the CVE loop, KEV-listed or not,
+    # so a missing _get_kev_catalog drops every result on that path.
+    _stub_requests_get(monkeypatch, _VULNCHECK_PAYLOAD)
+
+    result = vulncheck_check("CVE-2020-29127", "test-key", False, 3)
+
+    assert result.get("cvss_baseScore") == 7.5
+    assert not result.get("cisa_kev")
+    assert result.get("ransomware") == ""
+
+
+def test_kev_catalog_downloaded_once_per_run(monkeypatch):
+    kev_hits = []
+    _stub_requests_get(monkeypatch, _NVD_KEV_PAYLOAD, kev_hits=kev_hits)
+
+    threads = [Thread(target=nist_check, args=("CVE-2021-44228", None, 3)) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(kev_hits) == 1

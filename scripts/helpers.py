@@ -29,6 +29,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# CISA KEV catalog, downloaded at most once per run and shared by every worker thread
+_kev_catalog = None
+_kev_catalog_lock = threading.Lock()
+
+
+def _get_kev_catalog():
+    """
+    Return CISA's KEV catalog as a {cveID: entry} mapping, fetching it at most once per run.
+
+    Callers previously downloaded the multi-MB feed once per KEV-listed CVE. The double-checked
+    lock keeps the concurrent workers from all starting that download at the same time; a failed
+    fetch is deliberately not cached, so the exception reaches the caller's existing handler
+    exactly as it did before and the next CVE retries.
+    """
+    global _kev_catalog
+
+    if _kev_catalog is None:
+        with _kev_catalog_lock:
+            if _kev_catalog is None:
+                kev_data = requests.get(CISA_KEV_URL)
+                kev_data.raise_for_status()
+                _kev_catalog = {entry.get('cveID'): entry
+                                for entry in kev_data.json().get('vulnerabilities', [])}
+
+    return _kev_catalog
+
+
 # FIRST.org returns at most 100 rows per response, and 100 comma-separated IDs keeps the
 # query around 1.4 KB - well under the roughly 2 KB point past which the API stops
 # returning rows and answers "status": "OK" with "total": 0 instead of erroring.
